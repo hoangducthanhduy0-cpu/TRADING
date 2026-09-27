@@ -2,13 +2,15 @@ import sys
 import subprocess
 import os
 
-# Tự động cài đặt thư viện cần thiết nếu môi trường Cloud chưa cài đặt từ requirements.txt
-for _pkg in ["plotly", "ta"]:
+# ==============================================================================
+# 0. TỰ ĐỘNG CÀI ĐẶT THƯ VIỆN NẾU THIẾU (SELF-HEALING BOOTSTRAP)
+# ==============================================================================
+for _pkg in ["plotly", "matplotlib"]:
     try:
         __import__(_pkg)
     except ImportError:
         try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", _pkg])
+            subprocess.check_call([sys.executable, "-m", "pip", "install", _pkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
 
@@ -19,21 +21,26 @@ import io
 import time
 from datetime import datetime
 
-# Import Plotly an toàn
+# Kiểm tra thư viện vẽ biểu đồ Plotly
 try:
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
     import plotly.express as px
     HAS_PLOTLY = True
-except ImportError:
+except Exception:
     HAS_PLOTLY = False
+    go = None
+    make_subplots = None
+    px = None
 
-# Import ta an toàn (có pure pandas fallback)
+# Kiểm tra Matplotlib (Lớp đồ họa dự phòng an toàn tuyệt đối)
 try:
-    import ta
-    HAS_TA = True
-except ImportError:
-    HAS_TA = False
+    import matplotlib.pyplot as plt
+    HAS_MPL = True
+except Exception:
+    HAS_MPL = False
+    plt = None
+
 
 # ==============================================================================
 # 1. CẤU HÌNH TRANG WEB STREAMLIT
@@ -49,7 +56,7 @@ st.set_page_config(
 st.markdown("""
 <style>
     .main-title {
-        font-size: 2.2rem;
+        font-size: 2.1rem;
         font-weight: 800;
         background: linear-gradient(90deg, #1E88E5, #00ACC1);
         -webkit-background-clip: text;
@@ -58,19 +65,12 @@ st.markdown("""
     }
     .sub-title {
         color: #6c757d;
-        font-size: 1.05rem;
-        margin-bottom: 1.5rem;
-    }
-    .metric-card {
-        background-color: #f8f9fa;
-        border-radius: 10px;
-        padding: 15px;
-        border-left: 5px solid #1E88E5;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        font-size: 1.0rem;
+        margin-bottom: 1.2rem;
     }
     .signal-card {
         border-radius: 10px;
-        padding: 16px;
+        padding: 14px 18px;
         margin-bottom: 15px;
         font-weight: 600;
     }
@@ -94,36 +94,21 @@ st.markdown("""
         border: 1px solid #bdbdbd;
         color: #616161;
     }
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 8px;
-    }
-    .stTabs [data-baseweb="tab"] {
-        height: 48px;
-        border-radius: 6px;
-        padding-left: 16px;
-        padding-right: 16px;
-    }
 </style>
 """, unsafe_allow_html=True)
 
 
+# ==============================================================================
+# 2. HÀM TÍNH TOÁN CHỈ BÁO THUẦN PANDAS (CHÍNH XÁC 100%, KHÔNG CẦN TA-LIB)
+# ==============================================================================
+
 def calc_ema(series, window):
-    """Tính EMA bằng ta hoặc thuần pandas nếu ta chưa cài đặt"""
-    if HAS_TA:
-        try:
-            return ta.trend.ema_indicator(series, window=int(window))
-        except Exception:
-            pass
+    """Tính Exponential Moving Average thuần pandas (chuẩn xác từng phiên)"""
     return series.ewm(span=int(window), adjust=False).mean()
 
 
 def calc_obv(close, volume):
-    """Tính OBV bằng ta hoặc thuần pandas/numpy nếu ta chưa cài đặt"""
-    if HAS_TA:
-        try:
-            return ta.volume.on_balance_volume(close, volume)
-        except Exception:
-            pass
+    """Tính On-Balance Volume (OBV) thuần pandas & numpy"""
     diff = close.diff()
     direction = np.where(diff > 0, 1, np.where(diff < 0, -1, 0))
     direction[0] = 0
@@ -131,12 +116,7 @@ def calc_obv(close, volume):
 
 
 def get_ema_signals(data, price_col, ema_period):
-    """
-    Tạo tín hiệu mua/bán chỉ dựa trên chỉ báo EMA.
-    Mua khi giá đóng cửa vượt trên đường EMA.
-    Bán khi giá đóng cửa xuống dưới đường EMA.
-    Sử dụng tín hiệu của phiên trước shift(1) để tránh Look-ahead bias.
-    """
+    """Tín hiệu EMA: Mua khi Giá > EMA, Bán khi Giá < EMA (shift 1 phiên tránh Look-ahead)"""
     close = data[price_col]
     ema = calc_ema(close, ema_period)
     
@@ -145,17 +125,11 @@ def get_ema_signals(data, price_col, ema_period):
     
     entries = raw_entries.shift(1, fill_value=False)
     exits = raw_exits.shift(1, fill_value=False)
-    
     return entries, exits, ema
 
 
 def get_obv_signals(data, price_col, obv_slope_period=3):
-    """
-    Tạo tín hiệu mua/bán chỉ dựa trên độ dốc của chỉ báo OBV (On-Balance Volume).
-    Mua khi độ dốc OBV dương (áp lực mua tăng).
-    Bán khi độ dốc OBV âm (áp lực bán tăng).
-    Sử dụng tín hiệu của phiên trước shift(1) để tránh Look-ahead bias.
-    """
+    """Tín hiệu OBV: Mua khi Độ dốc OBV > 0, Bán khi Độ dốc OBV < 0 (shift 1)"""
     close = data[price_col]
     volume = data['Volume']
     obv = calc_obv(close, volume)
@@ -166,17 +140,11 @@ def get_obv_signals(data, price_col, obv_slope_period=3):
     
     entries = raw_entries.shift(1, fill_value=False)
     exits = raw_exits.shift(1, fill_value=False)
-    
     return entries, exits, obv, obv_slope
 
 
 def get_ema_obv_combined_signals(data, price_col, ema_period, obv_slope_period=3):
-    """
-    Tạo tín hiệu mua/bán kết hợp chỉ báo EMA và OBV:
-    Mua: Giá đóng cửa vượt trên EMA VÀ Độ dốc OBV dương.
-    Bán: Giá đóng cửa cắt xuống dưới đường EMA.
-    Sử dụng tín hiệu của phiên trước shift(1) để tránh Look-ahead bias.
-    """
+    """Tín hiệu Kết Hợp: Mua khi Giá > EMA VÀ OBV Slope > 0; Bán khi Giá < EMA (shift 1)"""
     close = data[price_col]
     volume = data['Volume']
     
@@ -189,9 +157,7 @@ def get_ema_obv_combined_signals(data, price_col, ema_period, obv_slope_period=3
     
     entries = raw_entries.shift(1, fill_value=False)
     exits = raw_exits.shift(1, fill_value=False)
-    
     return entries, exits, ema, obv, obv_slope
-
 
 
 # ==============================================================================
@@ -199,12 +165,7 @@ def get_ema_obv_combined_signals(data, price_col, ema_period, obv_slope_period=3
 # ==============================================================================
 
 def get_positions(entries, exits):
-    """
-    Hạch toán vị thế (Position Accounting) theo tuần tự thời gian:
-    - Chỉ mở vị thế Mua khi tài khoản chưa giữ cổ phiếu (current_position == 0).
-    - Chỉ đóng vị thế Bán khi tài khoản đang giữ cổ phiếu (current_position == 1).
-    - Loại bỏ tín hiệu nhiễu lặp lại khi đang giữ vị thế.
-    """
+    """Hạch toán vị thế (Position Accounting) theo thời gian: Long (1) <-> Tiền mặt (0)"""
     n = len(entries)
     position = pd.Series(0, index=entries.index, dtype=int)
     buy_orders = pd.Series(False, index=entries.index, dtype=bool)
@@ -233,13 +194,7 @@ def run_backtest_simulation(
     slippage=0.001,     # 0.1%
     sl_stop=0.07        # 7% Stop loss
 ):
-    """
-    Mô phỏng giao dịch chi tiết theo đúng logic của VectorBT:
-    - Long-only, không gom dồn lệnh (accumulate=False).
-    - Khấu trừ phí giao dịch và trượt giá khi Khớp lệnh Mua và Bán.
-    - Cắt lỗ Stop Loss: Nếu giá trong phiên chạm ngưỡng lỗ >= sl_stop (7%) so với giá mua.
-    - Xuất đầy đủ Equity Curve, Drawdown, Thống kê danh mục và Nhật ký lệnh (Trade Log).
-    """
+    """Mô phỏng backtest chuẩn mực: Phí, Trượt giá, Stop-loss 7%, Long-only 1 vị thế"""
     dates = df.index
     close_prices = df[price_col].values
     low_prices = df['Low'].values if 'Low' in df.columns else close_prices
@@ -259,17 +214,13 @@ def run_backtest_simulation(
         curr_close = close_prices[i]
         curr_low = low_prices[i]
         
-        # 1. Kiểm tra vị thế đang mở
+        # 1. Đang giữ cổ phiếu -> kiểm tra bán
         if shares > 0:
-            # Kiểm tra điều kiện Cắt lỗ Stop Loss (sl_stop)
             stop_price = entry_price * (1.0 - sl_stop)
             is_stop_loss = (curr_low <= stop_price) or (curr_close <= stop_price)
-            
-            # Kiểm tra điều kiện Bán theo tín hiệu Exit
             is_signal_exit = exits.iloc[i]
             
             if is_stop_loss or is_signal_exit:
-                # Thực hiện Bán
                 if is_stop_loss:
                     exit_price = min(curr_close, stop_price) * (1.0 - slippage)
                     reason = "Stop Loss (-7%)"
@@ -278,11 +229,9 @@ def run_backtest_simulation(
                     reason = "Tín hiệu Exit (EMA)"
                 
                 gross_revenue = shares * exit_price
-                fee_cost = gross_revenue * fees
-                net_revenue = gross_revenue - fee_cost
+                net_revenue = gross_revenue * (1.0 - fees)
                 cash += net_revenue
                 
-                # Ghi nhận nhật ký lệnh (Trade Log)
                 pnl_val = net_revenue - (shares * entry_price * (1.0 + fees + slippage))
                 pnl_pct = (exit_price / entry_price - 1.0 - 2 * fees - 2 * slippage) * 100.0
                 holding_days = (curr_date - entry_date).days
@@ -304,10 +253,9 @@ def run_backtest_simulation(
                 entry_price = 0.0
                 entry_date = None
         
-        # 2. Kiểm tra điều kiện Mở vị thế Mua mới
+        # 2. Đang giữ tiền mặt -> kiểm tra mua
         elif shares == 0:
             if entries.iloc[i]:
-                # Mua toàn bộ bằng tiền mặt hiện có (Long-only)
                 effective_entry_price = curr_close * (1.0 + slippage)
                 available_cash = cash
                 max_shares = available_cash / (effective_entry_price * (1.0 + fees))
@@ -319,7 +267,7 @@ def run_backtest_simulation(
                     entry_price = effective_entry_price
                     entry_date = curr_date
         
-        # 3. Định giá danh mục tại thời điểm cuối phiên
+        # 3. Định giá danh mục cuối phiên
         current_equity = cash + (shares * curr_close)
         portfolio_value[i] = current_equity
         positions[i] = 1 if shares > 0 else 0
@@ -328,14 +276,11 @@ def run_backtest_simulation(
     position_series = pd.Series(positions, index=dates)
     trades_df = pd.DataFrame(trades)
     
-    # 4. Tính toán các chỉ số hiệu suất
+    # 4. Tính toán chỉ số hiệu suất
     total_return = (equity_series.iloc[-1] / equity_series.iloc[0] - 1.0) * 100.0
-    
-    # Benchmark Buy & Hold
     benchmark_equity = (df[price_col] / df[price_col].iloc[0]) * initial_cash
     benchmark_return = (df[price_col].iloc[-1] / df[price_col].iloc[0] - 1.0) * 100.0
     
-    # Daily returns & Sharpe Ratio (annualized 252 trading days)
     daily_returns = equity_series.pct_change().dropna()
     mean_ret = daily_returns.mean()
     std_ret = daily_returns.std()
@@ -345,23 +290,15 @@ def run_backtest_simulation(
     else:
         sharpe_ratio = 0.0
         
-    # Sortino Ratio (downside deviation)
     negative_returns = daily_returns[daily_returns < 0]
     downside_std = negative_returns.std()
-    if downside_std > 1e-8:
-        sortino_ratio = (mean_ret / downside_std) * np.sqrt(252)
-    else:
-        sortino_ratio = 0.0
+    sortino_ratio = (mean_ret / downside_std) * np.sqrt(252) if downside_std > 1e-8 else 0.0
         
-    # Drawdown & Max Drawdown
     cummax_equity = equity_series.cummax()
     drawdown = (equity_series - cummax_equity) / cummax_equity * 100.0
     max_drawdown = drawdown.min()
-    
-    # Calmar Ratio
     calmar_ratio = abs(total_return / max_drawdown) if abs(max_drawdown) > 1e-4 else 0.0
     
-    # Thống kê giao dịch
     num_closed_trades = len(trades_df)
     if num_closed_trades > 0:
         winning_trades = trades_df[trades_df['Lợi nhuận (%)'] > 0]
@@ -436,8 +373,8 @@ with st.sidebar:
             candidates = [
                 "ACB.csv",
                 "LAN 1/ACB.csv",
-                os.path.join(os.path.dirname(__file__), "ACB.csv") if "__file__" in globals() else "ACB.csv",
-                os.path.join(os.path.dirname(__file__), "LAN 1", "ACB.csv") if "__file__" in globals() else "LAN 1/ACB.csv"
+                "LAN 2/ACB.csv",
+                os.path.join(os.path.dirname(__file__), "ACB.csv") if "__file__" in globals() else "ACB.csv"
             ]
             df = None
             for p in candidates:
@@ -460,7 +397,6 @@ with st.sidebar:
                 return None
                 
         df['Date'] = pd.to_datetime(df['Date'])
-
         df.set_index('Date', inplace=True)
         df.sort_index(inplace=True)
         return df
@@ -534,7 +470,7 @@ with st.sidebar:
 # ==============================================================================
 
 if df_full is None:
-    st.info("👋 Vui lòng đảm bảo file `ACB.csv` có trong thư mục hoặc tải file CSV lên từ thanh bên trái.")
+    st.info("👋 Vui lòng tải file ACB.csv lên từ thanh bên trái.")
     st.stop()
 
 # Cắt tập dữ liệu Train và Test
@@ -577,7 +513,6 @@ st.markdown('<div class="sub-title">Nghiên cứu & Đánh giá định lượng
 # Khuyến nghị Tín hiệu Thực chiến Phiên Mới Nhất
 latest_date = df_full.index[-1].strftime('%d/%m/%Y')
 latest_close = df_full[price_col].iloc[-1]
-# Kiểm tra trên toàn bộ dữ liệu để biết trạng thái vị thế hiện tại
 full_ent_comb, full_ext_comb, full_ema, full_obv, full_obv_slope = get_ema_obv_combined_signals(df_full, price_col, ema_period, obv_slope_period)
 pos_full, buy_orders_full, sell_orders_full = get_positions(full_ent_comb, full_ext_comb)
 curr_pos = pos_full.iloc[-1]
@@ -667,71 +602,92 @@ with tabs[0]:
     st.markdown("---")
     st.subheader("📈 Biểu Đồ Giá Kỹ Thuật, Chỉ Báo & Điểm Mua/Bán Thực Tế")
     
-    # Chuẩn bị dữ liệu hiển thị đồ thị
     plot_df = test_df if has_test else train_df
     plot_ema = test_ema_val if has_test else train_ema_val
-    plot_obv = test_obv_val if has_test else train_obv_val
     plot_obv_slope = test_obvs_val if has_test else train_obvs_val
     plot_trades = active_res['trades']
 
-    fig = make_subplots(
-        rows=2, cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.05,
-        row_heights=[0.7, 0.3],
-        subplot_titles=("Biểu đồ Giá ACB & Đường Trung Bình Động EMA kèm Điểm Giao Dịch", "Chỉ báo Độ dốc On-Balance Volume (OBV Slope)")
-    )
-
-    # 1. Đường giá
-    fig.add_trace(go.Scatter(
-        x=plot_df.index, y=plot_df[price_col],
-        mode='lines', name='Giá Đóng Cửa (Close)',
-        line=dict(color='#2962FF', width=1.5)
-    ), row=1, col=1)
-
-    # 2. Đường EMA
-    fig.add_trace(go.Scatter(
-        x=plot_df.index, y=plot_ema,
-        mode='lines', name=f'EMA ({ema_period})',
-        line=dict(color='#FF6D00', width=1.5, dash='dash')
-    ), row=1, col=1)
-
-    # 3. Điểm Mua & Điểm Bán từ nhật ký lệnh
-    if len(plot_trades) > 0:
-        buy_dates = pd.to_datetime(plot_trades['Ngày Mua'])
-        buy_prices = plot_trades['Giá Mua']
-        sell_dates = pd.to_datetime(plot_trades['Ngày Bán'])
-        sell_prices = plot_trades['Giá Bán']
+    # VẼ BIỂU ĐỒ TƯƠNG TÁC (PLOTLY HOẶC MATPLOTLIB FALLBACK)
+    if HAS_PLOTLY:
+        fig = make_subplots(
+            rows=2, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.05,
+            row_heights=[0.7, 0.3],
+            subplot_titles=("Biểu đồ Giá ACB & Đường Trung Bình Động EMA kèm Điểm Giao Dịch", "Chỉ báo Độ dốc On-Balance Volume (OBV Slope)")
+        )
 
         fig.add_trace(go.Scatter(
-            x=buy_dates, y=buy_prices,
-            mode='markers', name='Điểm MUA (Buy)',
-            marker=dict(symbol='triangle-up', size=11, color='#00C853', line=dict(width=1, color='black'))
+            x=plot_df.index, y=plot_df[price_col],
+            mode='lines', name='Giá Đóng Cửa (Close)',
+            line=dict(color='#2962FF', width=1.5)
         ), row=1, col=1)
 
         fig.add_trace(go.Scatter(
-            x=sell_dates, y=sell_prices,
-            mode='markers', name='Điểm BÁN (Sell)',
-            marker=dict(symbol='triangle-down', size=11, color='#D50000', line=dict(width=1, color='black'))
+            x=plot_df.index, y=plot_ema,
+            mode='lines', name=f'EMA ({ema_period})',
+            line=dict(color='#FF6D00', width=1.5, dash='dash')
         ), row=1, col=1)
 
-    # 4. Độ dốc OBV
-    colors = ['#00C853' if v > 0 else '#D50000' for v in plot_obv_slope.fillna(0)]
-    fig.add_trace(go.Bar(
-        x=plot_df.index, y=plot_obv_slope,
-        name=f'OBV Slope ({obv_slope_period})',
-        marker_color=colors
-    ), row=2, col=1)
+        if len(plot_trades) > 0:
+            buy_dates = pd.to_datetime(plot_trades['Ngày Mua'])
+            buy_prices = plot_trades['Giá Mua']
+            sell_dates = pd.to_datetime(plot_trades['Ngày Bán'])
+            sell_prices = plot_trades['Giá Bán']
 
-    fig.update_layout(
-        height=620,
-        margin=dict(l=20, r=20, t=40, b=20),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        hovermode="x unified"
-    )
-    fig.update_yaxes(title_text="Giá (VND)", row=1, col=1)
-    fig.update_yaxes(title_text="Độ dốc OBV", row=2, col=1)
-    st.plotly_chart(fig, use_container_width=True)
+            fig.add_trace(go.Scatter(
+                x=buy_dates, y=buy_prices,
+                mode='markers', name='Điểm MUA (Buy)',
+                marker=dict(symbol='triangle-up', size=11, color='#00C853', line=dict(width=1, color='black'))
+            ), row=1, col=1)
+
+            fig.add_trace(go.Scatter(
+                x=sell_dates, y=sell_prices,
+                mode='markers', name='Điểm BÁN (Sell)',
+                marker=dict(symbol='triangle-down', size=11, color='#D50000', line=dict(width=1, color='black'))
+            ), row=1, col=1)
+
+        colors = ['#00C853' if v > 0 else '#D50000' for v in plot_obv_slope.fillna(0)]
+        fig.add_trace(go.Bar(
+            x=plot_df.index, y=plot_obv_slope,
+            name=f'OBV Slope ({obv_slope_period})',
+            marker_color=colors
+        ), row=2, col=1)
+
+        fig.update_layout(
+            height=600,
+            margin=dict(l=20, r=20, t=40, b=20),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            hovermode="x unified"
+        )
+        fig.update_yaxes(title_text="Giá (VND)", row=1, col=1)
+        fig.update_yaxes(title_text="Độ dốc OBV", row=2, col=1)
+        st.plotly_chart(fig, use_container_width=True)
+    elif HAS_MPL:
+        # Fallback bằng Matplotlib nếu máy chủ chưa có Plotly
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7), sharex=True, gridspec_kw={'height_ratios': [3, 1]})
+        ax1.plot(plot_df.index, plot_df[price_col], label='Giá Đóng Cửa', color='#1E88E5', lw=1.5)
+        ax1.plot(plot_df.index, plot_ema, label=f'EMA ({ema_period})', color='#FF8F00', linestyle='--', lw=1.5)
+        
+        if len(plot_trades) > 0:
+            ax1.scatter(pd.to_datetime(plot_trades['Ngày Mua']), plot_trades['Giá Mua'], marker='^', color='green', s=60, label='MUA', zorder=5)
+            ax1.scatter(pd.to_datetime(plot_trades['Ngày Bán']), plot_trades['Giá Bán'], marker='v', color='red', s=60, label='BÁN', zorder=5)
+            
+        ax1.set_title("Biểu đồ Giá ACB, EMA và Điểm Mua/Bán", fontsize=12, fontweight='bold')
+        ax1.set_ylabel("Giá (VND)")
+        ax1.legend(loc='upper left')
+        ax1.grid(True, linestyle=':', alpha=0.6)
+        
+        colors = ['green' if v > 0 else 'red' for v in plot_obv_slope.fillna(0)]
+        ax2.bar(plot_df.index, plot_obv_slope, color=colors, width=1.5)
+        ax2.set_title(f"Độ dốc OBV ({obv_slope_period} phiên)", fontsize=10)
+        ax2.grid(True, linestyle=':', alpha=0.6)
+        
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
+    else:
+        st.line_chart(pd.DataFrame({'Giá ACB': plot_df[price_col], f'EMA ({ema_period})': plot_ema}))
 
 
 # ------------------------------------------------------------------------------
@@ -814,66 +770,51 @@ with tabs[1]:
 
     # 2. Biểu đồ Đường Cong Vốn (Equity Curve)
     st.markdown("#### 💰 Biểu Đồ Tăng Trưởng Tài Khoản (Equity Curve)")
-    fig_equity = go.Figure()
-    
-    fig_equity.add_trace(go.Scatter(
-        x=eval_df.index, y=eval_comb['equity'],
-        mode='lines', name=f'EMA+OBV Kết Hợp (Vốn: {eval_comb["equity"].iloc[-1]:,.0f})',
-        line=dict(color='#00C853', width=2.5)
-    ))
-    fig_equity.add_trace(go.Scatter(
-        x=eval_df.index, y=eval_ema['equity'],
-        mode='lines', name=f'EMA Riêng Lẻ (Vốn: {eval_ema["equity"].iloc[-1]:,.0f})',
-        line=dict(color='#2962FF', width=1.5, dash='dot')
-    ))
-    fig_equity.add_trace(go.Scatter(
-        x=eval_df.index, y=eval_obv['equity'],
-        mode='lines', name=f'OBV Riêng Lẻ (Vốn: {eval_obv["equity"].iloc[-1]:,.0f})',
-        line=dict(color='#FF6D00', width=1.5, dash='dash')
-    ))
-    fig_equity.add_trace(go.Scatter(
-        x=eval_df.index, y=eval_comb['benchmark_equity'],
-        mode='lines', name=f'Mua & Nắm Giữ (Buy & Hold)',
-        line=dict(color='#757575', width=1.5, dash='dashdot')
-    ))
-
-    fig_equity.update_layout(
-        height=450,
-        margin=dict(l=20, r=20, t=30, b=20),
-        xaxis_title="Thời Gian",
-        yaxis_title="Giá Trị Danh Mục (VND)",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        hovermode="x unified"
-    )
-    st.plotly_chart(fig_equity, use_container_width=True)
+    if HAS_PLOTLY:
+        fig_equity = go.Figure()
+        fig_equity.add_trace(go.Scatter(x=eval_df.index, y=eval_comb['equity'], mode='lines', name=f'EMA+OBV Kết Hợp', line=dict(color='#00C853', width=2.5)))
+        fig_equity.add_trace(go.Scatter(x=eval_df.index, y=eval_ema['equity'], mode='lines', name=f'EMA Riêng Lẻ', line=dict(color='#2962FF', width=1.5, dash='dot')))
+        fig_equity.add_trace(go.Scatter(x=eval_df.index, y=eval_obv['equity'], mode='lines', name=f'OBV Riêng Lẻ', line=dict(color='#FF6D00', width=1.5, dash='dash')))
+        fig_equity.add_trace(go.Scatter(x=eval_df.index, y=eval_comb['benchmark_equity'], mode='lines', name=f'Mua & Nắm Giữ (Buy & Hold)', line=dict(color='#757575', width=1.5, dash='dashdot')))
+        fig_equity.update_layout(height=450, margin=dict(l=20, r=20, t=30, b=20), xaxis_title="Thời Gian", yaxis_title="Giá Trị Danh Mục (VND)", hovermode="x unified")
+        st.plotly_chart(fig_equity, use_container_width=True)
+    elif HAS_MPL:
+        fig, ax = plt.subplots(figsize=(10, 4.5))
+        ax.plot(eval_df.index, eval_comb['equity'], label='EMA+OBV Kết Hợp', color='green', lw=2)
+        ax.plot(eval_df.index, eval_ema['equity'], label='EMA Riêng', color='blue', lw=1.2, linestyle=':')
+        ax.plot(eval_df.index, eval_obv['equity'], label='OBV Riêng', color='orange', lw=1.2, linestyle='--')
+        ax.plot(eval_df.index, eval_comb['benchmark_equity'], label='Buy & Hold', color='gray', lw=1.2, linestyle='-.')
+        ax.set_ylabel("Giá Trị Danh Mục (VND)")
+        ax.legend()
+        ax.grid(True, linestyle=':', alpha=0.6)
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
+    else:
+        st.line_chart(pd.DataFrame({'EMA+OBV': eval_comb['equity'], 'EMA': eval_ema['equity'], 'OBV': eval_obv['equity'], 'Buy&Hold': eval_comb['benchmark_equity']}))
 
     # 3. Biểu đồ Sụt Giảm Vốn (Drawdown Underwater Plot)
     st.markdown("#### 🌊 Biểu Đồ Mức Sụt Giảm Vốn Tối Đa (Drawdown Underwater)")
-    fig_dd = go.Figure()
-    fig_dd.add_trace(go.Scatter(
-        x=eval_df.index, y=eval_comb['drawdown'],
-        mode='lines', fill='tozeroy', name='EMA + OBV Kết Hợp',
-        line=dict(color='#00C853', width=1)
-    ))
-    fig_dd.add_trace(go.Scatter(
-        x=eval_df.index, y=eval_ema['drawdown'],
-        mode='lines', name='EMA Riêng',
-        line=dict(color='#2962FF', width=1)
-    ))
-    fig_dd.add_trace(go.Scatter(
-        x=eval_df.index, y=eval_obv['drawdown'],
-        mode='lines', name='OBV Riêng',
-        line=dict(color='#FF6D00', width=1)
-    ))
-    fig_dd.update_layout(
-        height=320,
-        margin=dict(l=20, r=20, t=30, b=20),
-        xaxis_title="Thời Gian",
-        yaxis_title="Sụt Giảm (%)",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        hovermode="x unified"
-    )
-    st.plotly_chart(fig_dd, use_container_width=True)
+    if HAS_PLOTLY:
+        fig_dd = go.Figure()
+        fig_dd.add_trace(go.Scatter(x=eval_df.index, y=eval_comb['drawdown'], mode='lines', fill='tozeroy', name='EMA + OBV Kết Hợp', line=dict(color='#00C853', width=1)))
+        fig_dd.add_trace(go.Scatter(x=eval_df.index, y=eval_ema['drawdown'], mode='lines', name='EMA Riêng', line=dict(color='#2962FF', width=1)))
+        fig_dd.add_trace(go.Scatter(x=eval_df.index, y=eval_obv['drawdown'], mode='lines', name='OBV Riêng', line=dict(color='#FF6D00', width=1)))
+        fig_dd.update_layout(height=320, margin=dict(l=20, r=20, t=30, b=20), xaxis_title="Thời Gian", yaxis_title="Sụt Giảm (%)", hovermode="x unified")
+        st.plotly_chart(fig_dd, use_container_width=True)
+    elif HAS_MPL:
+        fig, ax = plt.subplots(figsize=(10, 3))
+        ax.fill_between(eval_df.index, eval_comb['drawdown'], 0, color='green', alpha=0.3, label='EMA+OBV')
+        ax.plot(eval_df.index, eval_ema['drawdown'], color='blue', lw=1, label='EMA')
+        ax.plot(eval_df.index, eval_obv['drawdown'], color='orange', lw=1, label='OBV')
+        ax.set_ylabel("Sụt Giảm (%)")
+        ax.legend()
+        ax.grid(True, linestyle=':', alpha=0.6)
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
+    else:
+        st.area_chart(pd.DataFrame({'EMA+OBV Drawdown (%)': eval_comb['drawdown']}))
 
 
 # ------------------------------------------------------------------------------
@@ -890,7 +831,6 @@ with tabs[2]:
     if not has_test:
         st.warning("Vui lòng chọn chế độ phân chia có cả tập Train và tập Test ở thanh bên trái để hiển thị bảng so sánh.")
     else:
-        # Bảng tổng hợp số liệu Train vs Test
         comparison_records = [
             {'Chiến lược': 'EMA Riêng lẻ', 'Tập dữ liệu': 'Train', 'Tham số': f'EMA={ema_period}', 
              'Sharpe Ratio': res_train_ema['stats']['Sharpe Ratio'], 'Tổng lợi nhuận (%)': res_train_ema['stats']['Tổng Lợi Nhuận (%)'], 
@@ -918,38 +858,32 @@ with tabs[2]:
         st.markdown("#### 📋 Bảng Đối Chiếu Hiệu Suất Train vs Test")
         st.dataframe(comp_df, use_container_width=True, hide_index=True)
 
-        # Biểu đồ cột nhóm so sánh (Tái hiện đồ thị Cell 23 Notebook)
         st.markdown("#### 📊 Đồ Thị So Sánh Trực Quan: Sharpe, Lợi Nhuận & Sụt Giảm Tối Đa")
         
-        c_p1, c_p2, c_p3 = st.columns(3)
-        with c_p1:
-            fig_bar_sharpe = px.bar(
-                comp_df, x='Chiến lược', y='Sharpe Ratio', color='Tập dữ liệu',
-                barmode='group', text_auto='.2f', title='Sharpe Ratio (Hàng năm)',
-                color_discrete_map={'Train': '#1E88E5', 'Test': '#FFB300'}
-            )
-            fig_bar_sharpe.update_layout(height=380, margin=dict(l=10, r=10, t=40, b=10))
-            st.plotly_chart(fig_bar_sharpe, use_container_width=True)
+        if HAS_PLOTLY:
+            c_p1, c_p2, c_p3 = st.columns(3)
+            with c_p1:
+                fig_bar_sharpe = px.bar(comp_df, x='Chiến lược', y='Sharpe Ratio', color='Tập dữ liệu', barmode='group', text_auto='.2f', title='Sharpe Ratio (Hàng năm)')
+                st.plotly_chart(fig_bar_sharpe, use_container_width=True)
+            with c_p2:
+                fig_bar_ret = px.bar(comp_df, x='Chiến lược', y='Tổng lợi nhuận (%)', color='Tập dữ liệu', barmode='group', text_auto='.1f', title='Tổng Lợi Nhuận (%)')
+                st.plotly_chart(fig_bar_ret, use_container_width=True)
+            with c_p3:
+                fig_bar_mdd = px.bar(comp_df, x='Chiến lược', y='Max Drawdown (%)', color='Tập dữ liệu', barmode='group', text_auto='.1f', title='Max Drawdown (%)')
+                st.plotly_chart(fig_bar_mdd, use_container_width=True)
+        elif HAS_MPL:
+            fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+            for i, (metric, title) in enumerate([('Sharpe Ratio', 'Sharpe Ratio'), ('Tổng lợi nhuận (%)', 'Tổng Lợi Nhuận (%)'), ('Max Drawdown (%)', 'Max Drawdown (%)')]):
+                ax = axes[i]
+                pivot_m = comp_df.pivot(index='Chiến lược', columns='Tập dữ liệu', values=metric)
+                pivot_m.plot(kind='bar', ax=ax, colormap='viridis')
+                ax.set_title(title, fontweight='bold')
+                ax.grid(True, linestyle=':', alpha=0.6)
+                ax.tick_params(axis='x', rotation=15)
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
 
-        with c_p2:
-            fig_bar_ret = px.bar(
-                comp_df, x='Chiến lược', y='Tổng lợi nhuận (%)', color='Tập dữ liệu',
-                barmode='group', text_auto='.1f', title='Tổng Lợi Nhuận (%)',
-                color_discrete_map={'Train': '#43A047', 'Test': '#E53935'}
-            )
-            fig_bar_ret.update_layout(height=380, margin=dict(l=10, r=10, t=40, b=10))
-            st.plotly_chart(fig_bar_ret, use_container_width=True)
-
-        with c_p3:
-            fig_bar_mdd = px.bar(
-                comp_df, x='Chiến lược', y='Max Drawdown (%)', color='Tập dữ liệu',
-                barmode='group', text_auto='.1f', title='Max Drawdown (%)',
-                color_discrete_map={'Train': '#8E24AA', 'Test': '#D81B60'}
-            )
-            fig_bar_mdd.update_layout(height=380, margin=dict(l=10, r=10, t=40, b=10))
-            st.plotly_chart(fig_bar_mdd, use_container_width=True)
-
-        # Nhận định chuyên gia về Overfitting
         st.info("""
         💡 **Nhận định định lượng từ kết quả nghiên cứu:**
         - **Giai đoạn Train (2014-2020)**: Thị trường chứng khoán Việt Nam và ACB trải qua xu hướng tăng trưởng mạnh (Uptrend), cả 3 chiến lược đều mang lại lợi nhuận vượt trội (> 200%) với Sharpe Ratio > 1.0.
@@ -989,7 +923,6 @@ with tabs[3]:
         with c_tr4:
             st.metric("Lợi Nhuận Tốt Nhất", f"{active_trades_df['Lợi nhuận (%)'].max()}%")
 
-        # Nút tải CSV
         csv_buffer = io.StringIO()
         active_trades_df.to_csv(csv_buffer, index=False)
         st.download_button(
@@ -1006,20 +939,24 @@ with tabs[3]:
                 subset=['Lợi nhuận (%)', 'PnL (VND)']
             ),
             use_container_width=True,
-            height=400
+            height=380
         )
 
-        # Biểu đồ phân bổ lợi nhuận
         st.markdown("#### 📊 Phân Bổ Lợi Nhuận Từng Giao Dịch (%)")
-        fig_hist = px.histogram(
-            active_trades_df, x="Lợi nhuận (%)", nbins=25,
-            color_discrete_sequence=['#1E88E5'],
-            marginal="box",
-            title="Biểu đồ phân phối tần suất lợi nhuận các lệnh"
-        )
-        fig_hist.add_vline(x=0, line_dash="dash", line_color="red")
-        fig_hist.update_layout(height=350, margin=dict(l=20, r=20, t=40, b=20))
-        st.plotly_chart(fig_hist, use_container_width=True)
+        if HAS_PLOTLY:
+            fig_hist = px.histogram(active_trades_df, x="Lợi nhuận (%)", nbins=25, color_discrete_sequence=['#1E88E5'], marginal="box")
+            fig_hist.add_vline(x=0, line_dash="dash", line_color="red")
+            st.plotly_chart(fig_hist, use_container_width=True)
+        elif HAS_MPL:
+            fig, ax = plt.subplots(figsize=(8, 3.5))
+            ax.hist(active_trades_df['Lợi nhuận (%)'], bins=20, color='#1E88E5', edgecolor='black', alpha=0.7)
+            ax.axvline(0, color='red', linestyle='--')
+            ax.set_xlabel("Lợi Nhuận (%)")
+            ax.set_ylabel("Số Lệnh")
+            ax.grid(True, linestyle=':', alpha=0.6)
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
 
 
 # ------------------------------------------------------------------------------
@@ -1028,8 +965,8 @@ with tabs[3]:
 with tabs[4]:
     st.subheader("🎯 Tối Ưu Hóa Tham Số Chiến Lược (Hyperparameter Optimization)")
     st.markdown("""
-    Tính năng cho phép tìm kiếm cặp tham số `(EMA Period, OBV Slope)` tối ưu hóa **Sharpe Ratio** 
-    trên tập dữ liệu **Train**, đồng thời áp dụng ràng buộc **`MIN_TRADES >= 5`** để loại bỏ các tham số ảo 
+    Tìm kiếm cặp tham số `(EMA Period, OBV Slope)` tối ưu hóa **Sharpe Ratio** 
+    trên tập **Train**, đồng thời ràng buộc **`MIN_TRADES >= 5`** để loại bỏ các tham số ảo 
     không thực hiện giao dịch (đúng theo góp ý sửa lỗi của Giảng viên).
     """)
 
@@ -1069,7 +1006,6 @@ with tabs[4]:
                 tot_ret = sim['stats']['Tổng Lợi Nhuận (%)']
                 mdd = sim['stats']['Max Drawdown (%)']
                 
-                # Áp dụng điều kiện MIN_TRADES
                 is_valid = (n_trades >= min_trades) and np.isfinite(sharpe)
                 
                 results.append({
@@ -1102,18 +1038,30 @@ with tabs[4]:
             - **Số Giao Dịch**: `{int(best_row['Số Giao Dịch'])}` (thỏa mãn >= {min_trades} lệnh)
             """)
 
-            # Heatmap thể hiện Sharpe Ratio theo cặp tham số
             pivot_sharpe = opt_df.pivot(index='OBV_Slope', columns='EMA', values='Sharpe Ratio')
-            fig_heat = px.imshow(
-                pivot_sharpe,
-                labels=dict(x="Chu kỳ EMA", y="Chu kỳ OBV Slope", color="Sharpe Ratio"),
-                x=pivot_sharpe.columns,
-                y=pivot_sharpe.index,
-                color_continuous_scale="Viridis",
-                title="Bản Đồ Nhiệt Sharpe Ratio theo Bộ Tham Số (EMA vs OBV Slope)"
-            )
-            fig_heat.update_layout(height=480)
-            st.plotly_chart(fig_heat, use_container_width=True)
+            if HAS_PLOTLY:
+                fig_heat = px.imshow(
+                    pivot_sharpe,
+                    labels=dict(x="Chu kỳ EMA", y="Chu kỳ OBV Slope", color="Sharpe Ratio"),
+                    x=pivot_sharpe.columns, y=pivot_sharpe.index,
+                    color_continuous_scale="Viridis",
+                    title="Bản Đồ Nhiệt Sharpe Ratio theo Bộ Tham Số (EMA vs OBV Slope)"
+                )
+                st.plotly_chart(fig_heat, use_container_width=True)
+            elif HAS_MPL:
+                fig, ax = plt.subplots(figsize=(8, 5))
+                cax = ax.imshow(pivot_sharpe.values, cmap='viridis', aspect='auto')
+                ax.set_xticks(range(len(pivot_sharpe.columns)))
+                ax.set_xticklabels(pivot_sharpe.columns)
+                ax.set_yticks(range(len(pivot_sharpe.index)))
+                ax.set_yticklabels(pivot_sharpe.index)
+                ax.set_xlabel("Chu kỳ EMA")
+                ax.set_ylabel("Chu kỳ OBV Slope")
+                ax.set_title("Bản Đồ Nhiệt Sharpe Ratio")
+                fig.colorbar(cax)
+                plt.tight_layout()
+                st.pyplot(fig)
+                plt.close(fig)
 
             st.markdown("#### 📋 Top 10 Bộ Tham Số Tốt Nhất:")
             st.dataframe(valid_opt_df.head(10).drop(columns=['Hợp Lệ']), use_container_width=True, hide_index=True)
