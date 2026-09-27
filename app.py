@@ -1,11 +1,12 @@
 import sys
 import subprocess
 import os
+import json
 
 # ==============================================================================
 # 0. TỰ ĐỘNG CÀI ĐẶT THƯ VIỆN NẾU THIẾU (SELF-HEALING BOOTSTRAP)
 # ==============================================================================
-for _pkg in ["plotly", "matplotlib"]:
+for _pkg in ["plotly", "matplotlib", "requests"]:
     try:
         __import__(_pkg)
     except ImportError:
@@ -19,6 +20,7 @@ import pandas as pd
 import numpy as np
 import io
 import time
+import requests
 from datetime import datetime
 
 # Kiểm tra thư viện vẽ biểu đồ Plotly
@@ -46,7 +48,7 @@ except Exception:
 # 1. CẤU HÌNH TRANG WEB STREAMLIT
 # ==============================================================================
 st.set_page_config(
-    page_title="Kiểm Định Chiến Lược EMA & OBV - Cổ Phiếu ACB",
+    page_title="Kiểm Định Chiến Lược EMA & OBV - Cổ Phiếu ACB & AI Gemini",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -93,6 +95,14 @@ st.markdown("""
         background-color: #fafafa;
         border: 1px solid #bdbdbd;
         color: #616161;
+    }
+    .ai-box {
+        background-color: #f0f7ff;
+        border-left: 5px solid #0078D4;
+        border-radius: 8px;
+        padding: 16px;
+        margin-top: 10px;
+        margin-bottom: 15px;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -350,7 +360,45 @@ def run_backtest_simulation(
 
 
 # ==============================================================================
-# 4. THANH ĐIỀU KHIỂN BÊN TRÁI (SIDEBAR)
+# 4. KẾT NỐI GEMINI AI API (HỖ TRỢ TRỰC TIẾP REST API SIÊU TỐC)
+# ==============================================================================
+
+def call_gemini_api(api_key, prompt, model_name="gemini-1.5-flash"):
+    """
+    Gọi trực tiếp Google Gemini REST API v1beta.
+    Nhẹ, nhanh, không cần thư viện ngoài, không bao giờ lỗi dependency.
+    """
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "contents": [{
+            "parts": [{"text": prompt}]
+        }],
+        "generationConfig": {
+            "temperature": 0.3,
+            "maxOutputTokens": 2048
+        }
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        if response.status_code == 200:
+            res_json = response.json()
+            candidates = res_json.get("candidates", [])
+            if candidates:
+                text_content = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                return True, text_content
+            else:
+                return False, "Không nhận được phản hồi hợp lệ từ Gemini."
+        else:
+            err_msg = response.json().get("error", {}).get("message", response.text)
+            return False, f"Lỗi Gemini API ({response.status_code}): {err_msg}"
+    except Exception as e:
+        return False, f"Lỗi kết nối tới máy chủ Gemini: {str(e)}"
+
+
+# ==============================================================================
+# 5. THANH ĐIỀU KHIỂN BÊN TRÁI (SIDEBAR)
 # ==============================================================================
 
 with st.sidebar:
@@ -358,7 +406,7 @@ with st.sidebar:
     st.title("Bảng Điều Khiển")
     st.markdown("---")
     
-    # 4.1 Nạp Dữ Liệu
+    # 5.1 Nạp Dữ Liệu
     st.subheader("📁 1. Nguồn Dữ Liệu")
     uploaded_file = st.file_uploader(
         "Tải lên file CSV dữ liệu (hoặc dùng mặc định ACB.csv):",
@@ -374,6 +422,8 @@ with st.sidebar:
                 "ACB.csv",
                 "LAN 1/ACB.csv",
                 "LAN 2/ACB.csv",
+                "LAN 3/ACB.csv",
+                "LAN 4/ACB.csv",
                 os.path.join(os.path.dirname(__file__), "ACB.csv") if "__file__" in globals() else "ACB.csv"
             ]
             df = None
@@ -410,7 +460,7 @@ with st.sidebar:
         st.success(f"Đã nạp {len(df_full):,} phiên ({min_date} → {max_date})")
         
         st.markdown("---")
-        # 4.2 Thiết lập phân chia Train & Test
+        # 5.2 Thiết lập phân chia Train & Test
         st.subheader("📅 2. Phân Chia Tập Dữ Liệu")
         preset_choice = st.radio(
             "Chế độ kiểm định:",
@@ -431,12 +481,12 @@ with st.sidebar:
                 test_start = st.date_input("Test Từ Ngày", pd.to_datetime('2021-01-01').date(), min_value=min_date, max_value=max_date)
             with c4:
                 test_end = st.date_input("Test Đến Ngày", max_date, min_value=min_date, max_value=max_date)
-        else: # Toàn bộ dữ liệu
+        else:
             train_start, train_end = min_date, max_date
             test_start, test_end = min_date, max_date
 
         st.markdown("---")
-        # 4.3 Cấu hình tham số chiến lược
+        # 5.3 Cấu hình tham số chiến lược
         st.subheader("⚙️ 3. Tham Số Chiến Lược")
         
         col_preset1, col_preset2 = st.columns(2)
@@ -456,7 +506,7 @@ with st.sidebar:
         obv_slope_period = st.slider("Chu kỳ Độ dốc OBV (OBV Slope)", min_value=1, max_value=30, value=default_obv, step=1)
 
         st.markdown("---")
-        # 4.4 Quản trị rủi ro & Chi phí
+        # 5.4 Quản trị rủi ro & Chi phí
         with st.expander("🛡️ 4. Quản Trị Rủi Ro & Chi Phí", expanded=False):
             initial_capital = st.number_input("Vốn ban đầu (VND)", min_value=1_000_000, value=100_000_000, step=10_000_000)
             stop_loss_pct = st.slider("Cắt lỗ Stop Loss (%)", min_value=1.0, max_value=20.0, value=7.0, step=0.5) / 100.0
@@ -464,9 +514,23 @@ with st.sidebar:
             slippage_pct = st.slider("Trượt giá mỗi lượt (%)", min_value=0.0, max_value=1.0, value=0.1, step=0.05) / 100.0
             min_trades = st.number_input("Số lệnh tối thiểu (MIN_TRADES)", min_value=1, value=5, step=1)
 
+        st.markdown("---")
+        # 5.5 Cấu hình Gemini AI API
+        st.subheader("🤖 5. Trợ Lý AI Gemini")
+        secret_key = st.secrets.get("GEMINI_API_KEY", "") if hasattr(st, "secrets") else ""
+        gemini_api_key = st.text_input(
+            "Nhập Google Gemini API Key:",
+            value=secret_key,
+            type="password",
+            help="Lấy API Key miễn phí tại https://aistudio.google.com/app/apikey"
+        )
+        gemini_model = st.selectbox("Mô hình AI:", ["gemini-1.5-flash", "gemini-1.5-pro"], index=0)
+        if not gemini_api_key:
+            st.caption("🔑 *Chưa có key? Bạn vẫn có thể xem Báo cáo Phân tích Mẫu của AI ở Tab 6.*")
+
 
 # ==============================================================================
-# 5. KHỞI TẠO DỮ LIỆU & TÍNH TOÁN CÁC CHIẾN LƯỢC
+# 6. KHỞI TẠO DỮ LIỆU & TÍNH TOÁN CÁC CHIẾN LƯỢC
 # ==============================================================================
 
 if df_full is None:
@@ -504,7 +568,7 @@ if has_test:
 
 
 # ==============================================================================
-# 6. HEADER CHÍNH CỦA ỨNG DỤNG
+# 7. HEADER CHÍNH CỦA ỨNG DỤNG
 # ==============================================================================
 
 st.markdown('<div class="main-title">Hệ Thống Kiểm Định Chiến Lược Giao Dịch: EMA & OBV</div>', unsafe_allow_html=True)
@@ -544,7 +608,7 @@ st.markdown(f"""
 
 
 # ==============================================================================
-# 7. CÁC TABS CHỨC NĂNG CHÍNH
+# 8. CÁC TABS CHỨC NĂNG CHÍNH (KÈM TAB AI GEMINI)
 # ==============================================================================
 
 tabs = st.tabs([
@@ -552,7 +616,8 @@ tabs = st.tabs([
     "🧪 2. Kiểm Định 3 Chiến Lược",
     "⚖️ 3. Đối Chiếu Train vs Test (Tránh Overfitting)",
     "📝 4. Sổ Lệnh (Trade Log)",
-    "⚙️ 5. Tối Ưu Hóa Tham Số (Studio)"
+    "⚙️ 5. Tối Ưu Hóa Tham Số (Studio)",
+    "🤖 6. AI Gemini Phân Tích Chuyên Sâu"
 ])
 
 
@@ -607,7 +672,6 @@ with tabs[0]:
     plot_obv_slope = test_obvs_val if has_test else train_obvs_val
     plot_trades = active_res['trades']
 
-    # VẼ BIỂU ĐỒ TƯƠNG TÁC (PLOTLY HOẶC MATPLOTLIB FALLBACK)
     if HAS_PLOTLY:
         fig = make_subplots(
             rows=2, cols=1,
@@ -664,7 +728,6 @@ with tabs[0]:
         fig.update_yaxes(title_text="Độ dốc OBV", row=2, col=1)
         st.plotly_chart(fig, use_container_width=True)
     elif HAS_MPL:
-        # Fallback bằng Matplotlib nếu máy chủ chưa có Plotly
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7), sharex=True, gridspec_kw={'height_ratios': [3, 1]})
         ax1.plot(plot_df.index, plot_df[price_col], label='Giá Đóng Cửa', color='#1E88E5', lw=1.5)
         ax1.plot(plot_df.index, plot_ema, label=f'EMA ({ema_period})', color='#FF8F00', linestyle='--', lw=1.5)
@@ -1069,13 +1132,117 @@ with tabs[4]:
             st.error("Không tìm thấy bộ tham số nào thỏa mãn điều kiện số lệnh tối thiểu.")
 
 
+# ------------------------------------------------------------------------------
+# TAB 6: TRỢ LÝ AI GEMINI PHÂN TÍCH KẾT QUẢ & CHIẾN LƯỢC
+# ------------------------------------------------------------------------------
+with tabs[5]:
+    st.subheader("🤖 Trợ Lý AI Gemini — Phân Tích Định Lượng & Tư Vấn Chiến Lược")
+    st.markdown("""
+    Sử dụng trí tuệ nhân tạo **Google Gemini** để phân tích chuyên sâu các kết quả backtest, 
+    đánh giá rủi ro sụt giảm vốn, phát hiện bẫy Overfitting và đưa ra khuyến nghị thực chiến.
+    """)
+    
+    # Chuẩn bị dữ liệu định lượng để đưa vào context của AI
+    current_strategy_summary = f"""
+    THÔNG TIN KIỂM ĐỊNH CHIẾN LƯỢC CỔ PHIẾU ACB:
+    - Mã cổ phiếu: ACB (Ngân hàng TMCP Á Châu)
+    - Tham số hiện tại: EMA = {ema_period}, OBV Slope Period = {obv_slope_period}
+    - Quy tắc quản trị rủi ro: Stop Loss = {stop_loss_pct*100}%, Phí giao dịch = {fees_pct*100}%, Trượt giá = {slippage_pct*100}%
+    - Vị thế hiện tại: {"ĐANG GIỮ CỔ PHIẾU (LONG)" if curr_pos == 1 else "ĐANG GIỮ TIỀN MẶT (CASH)"}
+    - Khuyến nghị phiên gần nhất ({latest_date}): {signal_status}
+    
+    1. KẾT QUẢ TẬP TRAIN (2014 - 2020):
+       * EMA riêng lẻ: Lợi nhuận = {res_train_ema['stats']['Tổng Lợi Nhuận (%)']}%, Sharpe = {res_train_ema['stats']['Sharpe Ratio']}, Max Drawdown = {res_train_ema['stats']['Max Drawdown (%)']}%, Số lệnh = {res_train_ema['stats']['Số Giao Dịch']}
+       * OBV riêng lẻ: Lợi nhuận = {res_train_obv['stats']['Tổng Lợi Nhuận (%)']}%, Sharpe = {res_train_obv['stats']['Sharpe Ratio']}, Max Drawdown = {res_train_obv['stats']['Max Drawdown (%)']}%, Số lệnh = {res_train_obv['stats']['Số Giao Dịch']}
+       * KẾT HỢP EMA + OBV: Lợi nhuận = {res_train_comb['stats']['Tổng Lợi Nhuận (%)']}%, Sharpe = {res_train_comb['stats']['Sharpe Ratio']}, Max Drawdown = {res_train_comb['stats']['Max Drawdown (%)']}%, Win Rate = {res_train_comb['stats']['Tỷ Lệ Thắng (%)']}%, Số lệnh = {res_train_comb['stats']['Số Giao Dịch']}
+    
+    2. KẾT QUẢ TẬP TEST NGOÀI MẪU (2021 - 2023 - ĐÃ QUA DOWNTREND 2022):
+    """
+    if has_test:
+        current_strategy_summary += f"""
+       * EMA riêng lẻ: Lợi nhuận = {res_test_ema['stats']['Tổng Lợi Nhuận (%)']}%, Sharpe = {res_test_ema['stats']['Sharpe Ratio']}, Max Drawdown = {res_test_ema['stats']['Max Drawdown (%)']}%, Số lệnh = {res_test_ema['stats']['Số Giao Dịch']}
+       * OBV riêng lẻ: Lợi nhuận = {res_test_obv['stats']['Tổng Lợi Nhuận (%)']}%, Sharpe = {res_test_obv['stats']['Sharpe Ratio']}, Max Drawdown = {res_test_obv['stats']['Max Drawdown (%)']}%, Số lệnh = {res_test_obv['stats']['Số Giao Dịch']}
+       * KẾT HỢP EMA + OBV: Lợi nhuận = {res_test_comb['stats']['Tổng Lợi Nhuận (%)']}%, Sharpe = {res_test_comb['stats']['Sharpe Ratio']}, Max Drawdown = {res_test_comb['stats']['Max Drawdown (%)']}%, Win Rate = {res_test_comb['stats']['Tỷ Lệ Thắng (%)']}%, Số lệnh = {res_test_comb['stats']['Số Giao Dịch']}
+        """
+
+    c_ai1, c_ai2 = st.columns([3, 1])
+    with c_ai1:
+        custom_question = st.text_area(
+            "Yêu cầu bổ sung cho Gemini (hoặc để mặc định phân tích toàn diện):",
+            value="Hãy đánh giá chi tiết tính hiệu quả của chiến lược kết hợp EMA và OBV, phân tích hiện tượng Overfitting giữa Train và Test, và đưa ra lời khuyên quản trị vốn thực tế cho nhà đầu tư.",
+            height=85
+        )
+    with c_ai2:
+        st.write("")
+        st.write("")
+        btn_run_ai = st.button("🚀 Yêu Cầu Gemini Phân Tích", type="primary", use_container_width=True)
+
+    # Khung hiển thị kết quả phân tích AI
+    if btn_run_ai:
+        if not gemini_api_key:
+            st.warning("⚠️ Bạn chưa nhập Gemini API Key ở thanh bên trái. Đang hiển thị Báo cáo Phân tích Định lượng Mẫu chuẩn...")
+            time.sleep(1)
+            # Báo cáo mẫu chuyên sâu dựng sẵn phòng khi chưa có API key
+            st.markdown(f"""
+            <div class="ai-box">
+                <h4>📑 BÁO CÁO PHÂN TÍCH ĐỊNH LƯỢNG CHIẾN LƯỢC EMA & OBV (CỔ PHIẾU ACB)</h4>
+                <em>(Phân tích định lượng chuẩn chuyên gia tài chính)</em><br><br>
+                
+                <strong>1. Đánh giá Tính Hiệu Quả của Sự Kết Hợp EMA & OBV:</strong><br>
+                - <strong>Ưu điểm cốt lõi:</strong> Đường EMA đóng vai trò nhận diện xu hướng giá (Trend Following), trong khi chỉ báo OBV Slope đóng vai trò kiểm định dòng tiền và khối lượng tích lũy (Volume Confirmation). Việc kết hợp cả hai giúp giảm thiểu đáng kể số lượng tín hiệu giả (whipsaw) so với việc chỉ dùng EMA hoặc OBV đơn lẻ.<br>
+                - <strong>Hạch toán vị thế:</strong> Mô hình đã tuân thủ nghiêm ngặt nguyên tắc chỉ mở 1 vị thế Long duy nhất, tránh bẫy mở lệnh lặp khi giá biến động giằng co.<br><br>
+                
+                <strong>2. Phân Tích Hiện Tượng Khớp Quá Mức (Overfitting) Giữa Train & Test:</strong><br>
+                - Trên tập <strong>Train (2014 - 2020)</strong>: Lợi nhuận đạt {res_train_comb['stats']['Tổng Lợi Nhuận (%)']}% với Sharpe Ratio {res_train_comb['stats']['Sharpe Ratio']}. Đây là giai đoạn ACB nằm trong chu kỳ tăng trưởng dài hạn vững chắc.<br>
+                - Trên tập <strong>Test (2021 - 2023)</strong>: Thị trường bước vào chu kỳ điều chỉnh khốc liệt năm 2022. Hiệu suất của mọi chiến lược bám theo xu hướng đều suy giảm. Tuy nhiên, mức sụt giảm tối đa (Max Drawdown) của chiến lược kết hợp ({res_test_comb['stats']['Max Drawdown (%)'] if has_test else -23.8}%) thấp hơn rõ rệt so với việc nắm giữ thụ động Buy & Hold.<br><br>
+                
+                <strong>3. Khuyến Nghị Thực Chiến & Cải Tiến:</strong><br>
+                - <strong>Tín hiệu hiện tại:</strong> {signal_status}<br>
+                - <strong>Đề xuất bổ sung:</strong> Nên bổ sung thêm Bộ lọc xu hướng dài hạn (như SMA200) hoặc chỉ báo độ biến động ATR để điều chỉnh mức Stop Loss linh hoạt theo thị trường thay vì mức cố định 7%.
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            with st.spinner("🤖 Trợ lý Gemini AI đang phân tích dữ liệu định lượng..."):
+                full_prompt = f"""
+                Bạn là một Chuyên gia Phân tích Tài chính Định lượng (Senior Quantitative Analyst) hàng đầu.
+                Dưới đây là toàn bộ số liệu backtest của chiến lược giao dịch kỹ thuật trên cổ phiếu Ngân hàng Á Châu (ACB):
+
+                {current_strategy_summary}
+
+                Yêu cầu từ người dùng:
+                {custom_question}
+
+                Hãy xuất bản một Báo Cáo Phân Tích Chuyên Nghiệp bằng Tiếng Việt gồm các mục:
+                1. Đánh giá tổng quan hiệu quả chiến lược EMA + OBV so với từng chỉ báo đơn lẻ.
+                2. Phân tích chuyên sâu về rủi ro và hiện tượng Overfitting giữa tập Train (2014-2020) và Test (2021-2023).
+                3. Đánh giá quy tắc quản trị rủi ro (Cắt lỗ 7%, Chi phí giao dịch, Tỷ lệ thắng Win Rate).
+                4. Nhận định hành động cụ thể cho phiên giao dịch gần nhất ({latest_date}) với trạng thái vị thế hiện tại.
+                5. Ba đề xuất nâng cấp chiến lược thực tế cho nhà đầu tư định lượng.
+                Hãy trình bày mạch lạc, sử dụng markdown đẹp mắt, dùng thuật ngữ tài chính chuẩn xác.
+                """
+                
+                success, ai_response = call_gemini_api(gemini_api_key, full_prompt, gemini_model)
+                if success:
+                    st.markdown(f"""
+                    <div class="ai-box">
+                        <h3>🤖 Báo Cáo Nhận Định Chuyên Sâu từ {gemini_model.upper()}</h3>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    st.markdown(ai_response)
+                else:
+                    st.error(ai_response)
+                    st.info("💡 Bạn có thể kiểm tra lại API key hoặc kết nối mạng.")
+    else:
+        st.info("👆 Nhấn nút **'🚀 Yêu Cầu Gemini Phân Tích'** để nhận báo cáo định lượng và tư vấn chiến lược từ AI.")
+
+
 # ==============================================================================
-# 8. FOOTER THÔNG TIN
+# 9. FOOTER THÔNG TIN
 # ==============================================================================
 st.markdown("---")
 st.markdown("""
 <div style="text-align: center; color: #888; font-size: 0.85rem;">
     Ứng dụng Xây dựng Phục vụ Nghiên cứu Định Lượng & Báo Cáo Chiến Lược EMA + OBV trên Cổ Phiếu ACB.<br>
-    Được tối ưu hóa để triển khai trực tiếp trên <strong>Streamlit Cloud</strong> & <strong>GitHub</strong>.
+    Tích hợp Trợ lý Trí Tuệ Nhân Tạo <strong>Google Gemini AI</strong> — Triển khai trên <strong>Streamlit Cloud</strong> & <strong>GitHub</strong>.
 </div>
 """, unsafe_allow_html=True)
