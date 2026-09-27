@@ -1,13 +1,39 @@
+import sys
+import subprocess
+import os
+
+# Tự động cài đặt thư viện cần thiết nếu môi trường Cloud chưa cài đặt từ requirements.txt
+for _pkg in ["plotly", "ta"]:
+    try:
+        __import__(_pkg)
+    except ImportError:
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", _pkg])
+        except Exception:
+            pass
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import plotly.express as px
-import ta
 import io
 import time
 from datetime import datetime
+
+# Import Plotly an toàn
+try:
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    import plotly.express as px
+    HAS_PLOTLY = True
+except ImportError:
+    HAS_PLOTLY = False
+
+# Import ta an toàn (có pure pandas fallback)
+try:
+    import ta
+    HAS_TA = True
+except ImportError:
+    HAS_TA = False
 
 # ==============================================================================
 # 1. CẤU HÌNH TRANG WEB STREAMLIT
@@ -81,9 +107,28 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ==============================================================================
-# 2. HÀM TÍNH TOÁN CHỈ BÁO & TẠO TÍN HIỆU (THEO ĐÚNG NOTEBOOK)
-# ==============================================================================
+def calc_ema(series, window):
+    """Tính EMA bằng ta hoặc thuần pandas nếu ta chưa cài đặt"""
+    if HAS_TA:
+        try:
+            return ta.trend.ema_indicator(series, window=int(window))
+        except Exception:
+            pass
+    return series.ewm(span=int(window), adjust=False).mean()
+
+
+def calc_obv(close, volume):
+    """Tính OBV bằng ta hoặc thuần pandas/numpy nếu ta chưa cài đặt"""
+    if HAS_TA:
+        try:
+            return ta.volume.on_balance_volume(close, volume)
+        except Exception:
+            pass
+    diff = close.diff()
+    direction = np.where(diff > 0, 1, np.where(diff < 0, -1, 0))
+    direction[0] = 0
+    return pd.Series(volume.values * direction, index=close.index).cumsum()
+
 
 def get_ema_signals(data, price_col, ema_period):
     """
@@ -93,7 +138,7 @@ def get_ema_signals(data, price_col, ema_period):
     Sử dụng tín hiệu của phiên trước shift(1) để tránh Look-ahead bias.
     """
     close = data[price_col]
-    ema = ta.trend.ema_indicator(close, window=int(ema_period))
+    ema = calc_ema(close, ema_period)
     
     raw_entries = (close > ema)
     raw_exits = (close < ema)
@@ -113,7 +158,7 @@ def get_obv_signals(data, price_col, obv_slope_period=3):
     """
     close = data[price_col]
     volume = data['Volume']
-    obv = ta.volume.on_balance_volume(close, volume)
+    obv = calc_obv(close, volume)
     obv_slope = obv.diff(int(obv_slope_period))
     
     raw_entries = (obv_slope > 0)
@@ -135,8 +180,8 @@ def get_ema_obv_combined_signals(data, price_col, ema_period, obv_slope_period=3
     close = data[price_col]
     volume = data['Volume']
     
-    ema = ta.trend.ema_indicator(close, window=int(ema_period))
-    obv = ta.volume.on_balance_volume(close, volume)
+    ema = calc_ema(close, ema_period)
+    obv = calc_obv(close, volume)
     obv_slope = obv.diff(int(obv_slope_period))
     
     raw_entries = (close > ema) & (obv_slope > 0)
@@ -146,6 +191,7 @@ def get_ema_obv_combined_signals(data, price_col, ema_period, obv_slope_period=3
     exits = raw_exits.shift(1, fill_value=False)
     
     return entries, exits, ema, obv, obv_slope
+
 
 
 # ==============================================================================
@@ -387,14 +433,34 @@ with st.sidebar:
         if file_source is not None:
             df = pd.read_csv(file_source)
         else:
-            try:
-                df = pd.read_csv("ACB.csv")
-            except Exception:
-                # Dữ liệu dự phòng nếu chưa có file
+            candidates = [
+                "ACB.csv",
+                "LAN 1/ACB.csv",
+                os.path.join(os.path.dirname(__file__), "ACB.csv") if "__file__" in globals() else "ACB.csv",
+                os.path.join(os.path.dirname(__file__), "LAN 1", "ACB.csv") if "__file__" in globals() else "LAN 1/ACB.csv"
+            ]
+            df = None
+            for p in candidates:
+                if os.path.exists(p):
+                    try:
+                        df = pd.read_csv(p)
+                        break
+                    except Exception:
+                        pass
+            if df is None:
+                for root, _, files in os.walk("."):
+                    if "ACB.csv" in files:
+                        try:
+                            df = pd.read_csv(os.path.join(root, "ACB.csv"))
+                            break
+                        except Exception:
+                            pass
+            if df is None:
                 st.error("Không tìm thấy file ACB.csv. Vui lòng tải file lên.")
                 return None
                 
         df['Date'] = pd.to_datetime(df['Date'])
+
         df.set_index('Date', inplace=True)
         df.sort_index(inplace=True)
         return df
